@@ -11,7 +11,9 @@ from auth.utils import (
     create_access_token,
     decode_access_token,
 )
-from settings import settings
+
+# IMPORT UPDATED: Now referencing config.py instead of settings.py
+from config import settings
 from logger import logger
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -27,10 +29,15 @@ def register(user: UserRegister, db: Session = Depends(get_db)):
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Database check failed during registration.")
+        # Replaced exception() with error() per log level constraints
+        logger.error(f"Database check failed during registration: {str(e)}")
         raise HTTPException(status_code=500, detail="Database error during check")
 
-    hashed_pw = get_password_hash(user.password)
+    try:
+        hashed_pw = get_password_hash(user.password)
+    except Exception as e:
+        logger.error(f"Password hashing failed during registration: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal processing error")
 
     query_insert = text("""
         INSERT INTO users (username, email, password_hash) 
@@ -50,9 +57,10 @@ def register(user: UserRegister, db: Session = Depends(get_db)):
         logger.info(f"New user registered: {user.username} (ID: {new_user_id})")
         return {"message": "User created successfully", "user_id": new_user_id}
 
-    except Exception:
+    except Exception as e:
         db.rollback()
-        logger.exception("Registration insert error.")
+        # Replaced exception() with error()
+        logger.error(f"Registration insert error: {str(e)}")
         raise HTTPException(status_code=500, detail="Database error during registration")
 
 
@@ -87,8 +95,9 @@ def login(creds: UserLogin, response: Response, db: Session = Depends(get_db)):
 
     except HTTPException:
         raise
-    except Exception:
-        logger.exception("Unexpected login error.")
+    except Exception as e:
+        # Replaced exception() with error()
+        logger.error(f"Unexpected login error: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -98,24 +107,43 @@ def get_current_user(request: Request, db: Session = Depends(get_db)):
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    payload = decode_access_token(token)
+    try:
+        payload = decode_access_token(token)
+    except Exception as e:
+        logger.error(f"Error decoding access token: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal processing error")
+
     if not payload:
+        logger.warning("Invalid or expired token attempting to access /me")
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
     user_id = payload.get("sub")
     if not user_id:
+        logger.warning("Token missing user ID payload")
         raise HTTPException(status_code=401, detail="Token missing user ID")
 
-    query = text("SELECT id, username, email FROM users WHERE id = :uid")
-    user = db.execute(query, {"uid": int(user_id)}).mappings().fetchone()
+    try:
+        query = text("SELECT id, username, email FROM users WHERE id = :uid")
+        user = db.execute(query, {"uid": int(user_id)}).mappings().fetchone()
 
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        if not user:
+            logger.warning(f"User ID {user_id} parsed from token but not found in database")
+            raise HTTPException(status_code=404, detail="User not found")
 
-    return user
+        return user
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Database error while fetching current user: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/logout")
 def logout(response: Response):
-    response.delete_cookie("access_token")
-    return {"message": "Logged out"}
+    try:
+        response.delete_cookie("access_token")
+        logger.info("User logged out successfully")
+        return {"message": "Logged out"}
+    except Exception as e:
+        logger.error(f"Error during logout: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error during logout")

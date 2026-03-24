@@ -3,11 +3,11 @@ from typing import Optional, Dict, Any
 from datetime import datetime, timedelta, timezone
 
 from passlib.context import CryptContext
-from passlib.exc import MissingBackendError
 from passlib.utils import saslprep
 from jose import jwt, JWTError, ExpiredSignatureError
 
-from settings import settings
+# IMPORT FIX: Use the single-source-of-truth config alias
+from config import settings
 from logger import logger
 
 # =========================
@@ -39,15 +39,13 @@ def _init_password_context() -> CryptContext:
         test_ctx.hash("test")
         bcrypt_working = True
     except Exception as e:
-        logger.warning(f"Bcrypt backend check failed: {e}. Falling back to pbkdf2 only.")
+        logger.warning(f"Bcrypt backend check failed: {str(e)}. Falling back to pbkdf2 only.")
 
     # 3. If bcrypt works, insert it at the START of the list (making it the default)
     if bcrypt_working:
         schemes.insert(0, "bcrypt_sha256")
 
     # 4. Create the final context with ALL supported schemes
-    # passlib will use the first scheme for hashing new passwords,
-    # but can verify passwords using ANY scheme in the list.
     try:
         ctx = CryptContext(
             schemes=schemes,
@@ -58,10 +56,11 @@ def _init_password_context() -> CryptContext:
         _pwd_context = ctx
         return _pwd_context
     except Exception as exc:
-        logger.exception("Critical error initializing password context.")
-        raise exc
+        # CRITICAL FIX: Do not crash the application on import. Use a basic fallback.
+        logger.error(f"Critical error initializing password context: {str(exc)}. Falling back to basic pbkdf2_sha256.")
+        return CryptContext(schemes=["pbkdf2_sha256"])
 
-# initialize at import
+# initialize at import safely
 pwd_context = _init_password_context()
 
 
@@ -77,8 +76,9 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     try:
         normalized = saslprep(plain_password) if isinstance(plain_password, str) else plain_password
         return pwd_context.verify(normalized, hashed_password)
-    except Exception:
-        logger.exception("Password verification failed.")
+    except Exception as e:
+        # REPLACED exception() with error()
+        logger.error(f"Password verification failed: {str(e)}")
         return False
 
 
@@ -89,13 +89,14 @@ def get_password_hash(password: str) -> str:
     try:
         normalized = saslprep(password) if isinstance(password, str) else password
         return pwd_context.hash(normalized)
-    except Exception:
-        logger.exception("Password hashing failed.")
+    except Exception as e:
+        # REPLACED exception() with error()
+        logger.error(f"Password hashing failed: {str(e)}")
         raise
 
 
 # =========================
-# JWT HELPERS (Keep existing code below)
+# JWT HELPERS
 # =========================
 
 def create_access_token(data: Dict[str, Any]) -> str:
@@ -110,12 +111,14 @@ def create_access_token(data: Dict[str, Any]) -> str:
             "token_type": "access",
         }
 
+        # Safely extract secret value if it's a Pydantic SecretStr, otherwise use raw
         secret = settings.JWT_SECRET.get_secret_value() if hasattr(settings.JWT_SECRET, "get_secret_value") else settings.JWT_SECRET
 
         token = jwt.encode(payload, secret, algorithm=settings.ALGORITHM)
         return token
-    except Exception:
-        logger.exception("Access token creation failed.")
+    except Exception as e:
+        # REPLACED exception() with error()
+        logger.error(f"Access token creation failed: {str(e)}")
         raise
 
 
@@ -133,9 +136,10 @@ def decode_access_token(token: str) -> Optional[Dict[str, Any]]:
     except ExpiredSignatureError:
         logger.warning("JWT token expired.")
         return None
-    except JWTError:
-        logger.warning("Invalid JWT token.")
+    except JWTError as e:
+        logger.warning(f"Invalid JWT token: {str(e)}")
         return None
-    except Exception:
-        logger.exception("Token decoding failed.")
+    except Exception as e:
+        # REPLACED exception() with error()
+        logger.error(f"Token decoding failed: {str(e)}")
         return None

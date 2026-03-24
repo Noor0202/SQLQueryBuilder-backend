@@ -12,6 +12,9 @@ from auth.routes import get_current_user
 from auth.encryption import decrypt_password, encrypt_password
 from services.metadata import get_target_db_connection, transform_metadata_to_json, QUERY_TABLES, QUERY_COLUMNS, QUERY_FKS
 
+# IMPORT FIX: Add logger
+from logger import logger
+
 router = APIRouter(prefix="/api/db-connections", tags=["connections"])
 
 @router.post("/test")
@@ -19,14 +22,16 @@ def test_connection(creds: DBConnectionCreate, current_user: User = Depends(get_
     try:
         conn = get_target_db_connection(creds, creds.password)
         conn.close()
+        logger.info(f"User '{current_user.username}' successfully tested connection to '{creds.host}'.")
         return {"status": "success", "message": "Connected successfully!"}
     except Exception as e:
+        logger.error(f"Connection test failed for user '{current_user.username}' to '{creds.host}': {str(e)}")
         raise HTTPException(status_code=400, detail=f"Connection failed: {str(e)}")
 
 @router.post("/save", response_model=DBConnectionResponse)
 def save_connection(creds: DBConnectionCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    # 1. Test External Connection and Fetch Metadata
     try:
-        # 1. Connect & Fetch
         conn = get_target_db_connection(creds, creds.password)
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         
@@ -40,11 +45,13 @@ def save_connection(creds: DBConnectionCreate, db: Session = Depends(get_db), cu
         fks = cursor.fetchall()
         
         conn.close()
+    except Exception as e:
+        logger.error(f"Failed to fetch metadata during save for host '{creds.host}': {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Failed to fetch schema metadata: {str(e)}")
 
-        # 2. Transform
+    # 2. Transform Metadata and Save to Database
+    try:
         metadata_json = transform_metadata_to_json(tables, columns, fks)
-
-        # 3. Encrypt & Save
         encrypted_pw = encrypt_password(creds.password)
         
         new_conn = DBConnection(
@@ -64,38 +71,61 @@ def save_connection(creds: DBConnectionCreate, db: Session = Depends(get_db), cu
         db.add(new_metadata)
         db.commit()
         db.refresh(new_conn)
+        
+        logger.info(f"Connection '{creds.name}' (ID: {new_conn.id}) successfully saved for user '{current_user.username}'.")
         return new_conn
     except Exception as e:
         db.rollback()
-        print(f"Error saving connection: {e}") 
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+        logger.error(f"Database error while saving connection '{creds.name}': {str(e)}") 
+        raise HTTPException(status_code=500, detail="An internal error occurred while saving the connection.")
 
 @router.get("", response_model=List[DBConnectionResponse])
 def get_user_connections(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    return db.query(DBConnection).filter(DBConnection.user_id == current_user.id).order_by(DBConnection.created_at.desc()).all()
+    try:
+        return db.query(DBConnection).filter(DBConnection.user_id == current_user.id).order_by(DBConnection.created_at.desc()).all()
+    except Exception as e:
+        logger.error(f"Failed to retrieve connections for user '{current_user.username}': {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve database connections.")
 
 @router.get("/{conn_id}")
 def get_connection_metadata(conn_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    conn = db.query(DBConnection).filter(DBConnection.id == conn_id, DBConnection.user_id == current_user.id).first()
-    if not conn:
-        raise HTTPException(status_code=404, detail="Connection not found")
-    
-    meta = db.query(DBMetadata).filter(DBMetadata.connection_id == conn_id).first()
-    return {
-        "connection": conn,
-        "schema": meta.schema_json if meta else None
-    }
+    try:
+        conn = db.query(DBConnection).filter(DBConnection.id == conn_id, DBConnection.user_id == current_user.id).first()
+        if not conn:
+            logger.warning(f"Metadata requested for non-existent or unauthorized connection ID: {conn_id} by user '{current_user.username}'")
+            raise HTTPException(status_code=404, detail="Connection not found")
+        
+        meta = db.query(DBMetadata).filter(DBMetadata.connection_id == conn_id).first()
+        return {
+            "connection": conn,
+            "schema": meta.schema_json if meta else None
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Database error retrieving metadata for connection {conn_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve connection metadata.")
 
 @router.delete("/{conn_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_connection(conn_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    conn = db.query(DBConnection).filter(DBConnection.id == conn_id, DBConnection.user_id == current_user.id).first()
-    if not conn:
-        raise HTTPException(status_code=404, detail="Connection not found")
+    try:
+        conn = db.query(DBConnection).filter(DBConnection.id == conn_id, DBConnection.user_id == current_user.id).first()
+        if not conn:
+            logger.warning(f"Delete requested for non-existent or unauthorized connection ID: {conn_id} by user '{current_user.username}'")
+            raise HTTPException(status_code=404, detail="Connection not found")
 
-    db.query(DBMetadata).filter(DBMetadata.connection_id == conn_id).delete()
-    db.delete(conn)
-    db.commit()
-    return
+        db.query(DBMetadata).filter(DBMetadata.connection_id == conn_id).delete()
+        db.delete(conn)
+        db.commit()
+        
+        logger.info(f"Connection ID {conn_id} successfully deleted by user '{current_user.username}'.")
+        return
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to delete connection {conn_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to delete connection.")
 
 # --- EXECUTE QUERY ENDPOINT (Updated for Pagination) ---
 @router.post("/{conn_id}/execute")
@@ -105,21 +135,27 @@ def execute_query(
     db: Session = Depends(get_db), 
     current_user: User = Depends(get_current_user)
 ):
-    print(f"\n--- Executing Query for Conn ID: {conn_id} (Page {query_req.page}) ---")
+    logger.info(f"User '{current_user.username}' executing query on Connection ID {conn_id} (Page {query_req.page})")
     
-    conn_record = db.query(DBConnection).filter(
-        DBConnection.id == conn_id, 
-        DBConnection.user_id == current_user.id
-    ).first()
+    try:
+        conn_record = db.query(DBConnection).filter(
+            DBConnection.id == conn_id, 
+            DBConnection.user_id == current_user.id
+        ).first()
+    except Exception as e:
+        logger.error(f"Failed to fetch connection record {conn_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error fetching connection.")
 
     if not conn_record:
+        logger.warning(f"Query execution blocked: Connection {conn_id} not found or unauthorized.")
         raise HTTPException(status_code=404, detail="Connection not found")
 
     try:
         try:
             real_password = decrypt_password(conn_record.encrypted_password)
         except ValueError:
-            raise Exception("Cannot decrypt password. Please delete and re-add this connection.")
+            logger.error(f"Decryption failed for connection ID {conn_id}.")
+            raise HTTPException(status_code=500, detail="Cannot decrypt password. Please delete and re-add this connection.")
 
         creds = SimpleNamespace(
             host=conn_record.host,
@@ -135,8 +171,7 @@ def execute_query(
         # 1. Clean SQL (remove trailing semicolon)
         clean_sql = query_req.sql.strip().rstrip(';')
         
-        # 2. Get Total Count (Only on first page, or every time if lightweight)
-        # Wrapping in subquery is safest way to count arbitrary SQL results
+        # 2. Get Total Count (Wrapping in subquery is safest way to count arbitrary SQL results)
         count_sql = f"SELECT COUNT(*) as total_count FROM ({clean_sql}) AS count_wrapper"
         cursor.execute(count_sql)
         count_result = cursor.fetchone()
@@ -147,7 +182,7 @@ def execute_query(
 
         # 4. Fetch Paginated Data
         paginated_sql = f"{clean_sql} LIMIT {query_req.limit} OFFSET {offset}"
-        print(f"Running: {paginated_sql}")
+        logger.info(f"Running paginated SQL for Conn ID {conn_id}: LIMIT {query_req.limit} OFFSET {offset}")
         
         cursor.execute(paginated_sql)
         
@@ -165,7 +200,10 @@ def execute_query(
             "limit": query_req.limit
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Query execution failed: {e}")
-        # Return simple error message
+        # Expected errors here are typically user SQL syntax errors
+        logger.error(f"Query execution failed for Conn ID {conn_id}: {str(e)}")
+        # Return simple error message to the frontend without the full traceback stack
         raise HTTPException(status_code=400, detail=str(e).split('\n')[0])
