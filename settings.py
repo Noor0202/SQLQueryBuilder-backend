@@ -22,8 +22,8 @@ class Settings(BaseSettings):
     BCRYPT_SALT_ROUNDS: int = 12
 
     # ---- CORS ----
-    # CRITICAL FIX: Allow both Port 3000 (React Scripts) and 5173 (Vite)
-    ALLOWED_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173"
+    # Default to strictly allow Vite frontend. Override via .env in production.
+    ALLOWED_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
 
     # ---- Environment / Logging ----
     LOG_LEVEL: str = "INFO"
@@ -55,15 +55,12 @@ class Settings(BaseSettings):
          2) Build from DB_* components
         Raises ValueError if neither is properly configured.
         """
-        # 1. If a full URL is provided, use it
         if self.DATABASE_URL:
             return self.DATABASE_URL
 
-        # 2. Fallback: Build from components
         if all([self.DB_HOST, self.DB_PORT, self.DB_USER, self.DB_PASS, self.DB_NAME]):
             return f"postgresql://{self.DB_USER}:{self.DB_PASS}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
 
-        # 3. Error if nothing is set
         raise ValueError(
             "DATABASE_URL is not set and DB_* components are incomplete. "
             "Please set DATABASE_URL in .env or set DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME."
