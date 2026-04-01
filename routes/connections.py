@@ -1,4 +1,9 @@
 # backend/connections.py
+import re
+import uuid
+from datetime import datetime, date, time, timedelta
+from decimal import Decimal
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from psycopg2.extras import RealDictCursor
@@ -12,10 +17,37 @@ from auth.routes import get_current_user
 from auth.encryption import decrypt_password, encrypt_password
 from services.metadata import get_target_db_connection, transform_metadata_to_json, QUERY_TABLES, QUERY_COLUMNS, QUERY_FKS
 
-# IMPORT FIX: Add logger
 from logger import logger
 
 router = APIRouter(prefix="/api/db-connections", tags=["connections"])
+
+# --- FIX: UNIVERSAL TYPE SANITIZER ---
+# Prevents FastAPI's JSON encoder from collapsing custom psycopg2 objects into {}
+def sanitize_value(val: Any) -> Any:
+    if val is None:
+        return None
+    if isinstance(val, (int, float, str, bool)):
+        return val
+    if isinstance(val, dict):
+        return {k: sanitize_value(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [sanitize_value(v) for v in val]
+    if isinstance(val, tuple):
+        return tuple(sanitize_value(v) for v in val)
+    if isinstance(val, Decimal):
+        return float(val)
+    if isinstance(val, (datetime, date, time)):
+        return val.isoformat()
+    if isinstance(val, timedelta):
+        return str(val)
+    if isinstance(val, (memoryview, bytes, bytearray)):
+        return "<Binary Data>"
+    if isinstance(val, uuid.UUID):
+        return str(val)
+    
+    # Catch-all: Converts psycopg2 Ranges, Multiranges, PostGIS geometries, INET, etc. to strings
+    return str(val)
+
 
 @router.post("/test")
 def test_connection(creds: DBConnectionCreate, current_user: User = Depends(get_current_user)):
@@ -127,7 +159,7 @@ def delete_connection(conn_id: int, db: Session = Depends(get_db), current_user:
         logger.error(f"Failed to delete connection {conn_id}: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to delete connection.")
 
-# --- EXECUTE QUERY ENDPOINT (Updated for Pagination) ---
+# --- EXECUTE QUERY ENDPOINT ---
 @router.post("/{conn_id}/execute")
 def execute_query(
     conn_id: int, 
@@ -165,45 +197,59 @@ def execute_query(
             ssl_mode=conn_record.ssl_mode
         )
 
-        conn = get_target_db_connection(creds, real_password)
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        conn = None
+        try:
+            conn = get_target_db_connection(creds, real_password)
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
 
-        # 1. Clean SQL (remove trailing semicolon)
-        clean_sql = query_req.sql.strip().rstrip(';')
-        
-        # 2. Get Total Count (Wrapping in subquery is safest way to count arbitrary SQL results)
-        count_sql = f"SELECT COUNT(*) as total_count FROM ({clean_sql}) AS count_wrapper"
-        cursor.execute(count_sql)
-        count_result = cursor.fetchone()
-        total_rows = count_result['total_count'] if count_result else 0
+            # 1. Clean SQL (remove trailing semicolon)
+            clean_sql = query_req.sql.strip().rstrip(';')
+            
+            # FIX: Security rule - ensure read-only
+            if not re.match(r'^SELECT\s', clean_sql, re.IGNORECASE):
+                raise HTTPException(status_code=403, detail="Security Exception: Only SELECT queries are permitted.")
+            
+            # 2. Get Total Count
+            count_sql = f"SELECT COUNT(*) as total_count FROM ({clean_sql}) AS count_wrapper"
+            cursor.execute(count_sql)
+            count_result = cursor.fetchone()
+            total_rows = count_result['total_count'] if count_result else 0
 
-        # 3. Calculate Offset
-        offset = (query_req.page - 1) * query_req.limit
+            # 3. Calculate Offset
+            offset = (query_req.page - 1) * query_req.limit
 
-        # 4. Fetch Paginated Data
-        paginated_sql = f"{clean_sql} LIMIT {query_req.limit} OFFSET {offset}"
-        logger.info(f"Running paginated SQL for Conn ID {conn_id}: LIMIT {query_req.limit} OFFSET {offset}")
-        
-        cursor.execute(paginated_sql)
-        
-        rows = []
-        if cursor.description:
-            rows = cursor.fetchall()
-            rows = [dict(row) for row in rows]
+            # 4. Fetch Paginated Data
+            paginated_sql = f"{clean_sql} LIMIT {query_req.limit} OFFSET {offset}"
+            logger.info(f"Running paginated SQL for Conn ID {conn_id}: LIMIT {query_req.limit} OFFSET {offset}")
+            
+            cursor.execute(paginated_sql)
+            
+            rows = []
+            if cursor.description:
+                raw_rows = cursor.fetchall()
+                # FIX: Applying the universal type sanitizer before passing to JSON
+                rows = [{k: sanitize_value(v) for k, v in dict(row).items()} for row in raw_rows]
 
-        conn.close()
+            return {
+                "rows": rows,
+                "total_rows": total_rows,
+                "page": query_req.page,
+                "limit": query_req.limit
+            }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Query execution failed for Conn ID {conn_id}: {str(e)}")
+            raise HTTPException(status_code=400, detail=str(e).split('\n')[0])
         
-        return {
-            "rows": rows,
-            "total_rows": total_rows,
-            "page": query_req.page,
-            "limit": query_req.limit
-        }
+        finally:
+            # FIX: Connection Leak Prevention
+            if conn:
+                conn.close()
 
     except HTTPException:
         raise
     except Exception as e:
-        # Expected errors here are typically user SQL syntax errors
-        logger.error(f"Query execution failed for Conn ID {conn_id}: {str(e)}")
-        # Return simple error message to the frontend without the full traceback stack
-        raise HTTPException(status_code=400, detail=str(e).split('\n')[0])
+        logger.error(f"Outer wrapper execution failure for Conn ID {conn_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal processing error.")
